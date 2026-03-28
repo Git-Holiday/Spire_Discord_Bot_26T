@@ -1,0 +1,158 @@
+"""
+Scheduler cog — posts the daily reservation thread and sends confirmation DMs.
+"""
+import datetime
+import logging
+import discord
+from discord.ext import commands
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+import pytz
+
+from config import (
+    RESERVATIONS_CHANNEL_ID,
+    TIMEZONE,
+    DAILY_POST_HOUR,
+    DAILY_POST_MINUTE,
+    CONFIRMATION_HOUR,
+    CONFIRMATION_MINUTE,
+    TABLES,
+    TABLE_MAP,
+    SLOT_MAP,
+)
+from database import (
+    get_daily_post,
+    save_daily_post,
+    get_unconfirmed_reservations_for_date,
+)
+from embeds import (
+    make_header_embed,
+    make_table_embed,
+    make_table_view,
+    make_dm_embed,
+    make_dm_view,
+)
+
+log = logging.getLogger(__name__)
+
+
+async def post_daily_reservations(bot: discord.Client) -> None:
+    """Create the daily reservation thread in the configured channel."""
+    channel = bot.get_channel(RESERVATIONS_CHANNEL_ID)
+    if channel is None:
+        channel = await bot.fetch_channel(RESERVATIONS_CHANNEL_ID)
+
+    today = datetime.date.today()
+    date_str = today.isoformat()
+
+    # Don't double-post if already done today
+    existing = await get_daily_post(date_str)
+    if existing:
+        log.info("Daily post for %s already exists — skipping", date_str)
+        return
+
+    # Post header message and create a thread from it
+    header_msg = await channel.send(embed=make_header_embed(today))
+
+    day_label = today.strftime("%A %d %B %Y")
+    thread = await header_msg.create_thread(
+        name=f"Reservations — {day_label}",
+        auto_archive_duration=1440,  # archive after 24 h
+    )
+
+    # Post one message per table into the thread
+    table_message_ids: dict[str, int] = {}
+    for table in TABLES:
+        embed = make_table_embed(table, {})          # no bookings yet
+        view  = make_table_view(date_str, table["id"], {})
+        msg   = await thread.send(embed=embed, view=view)
+        table_message_ids[str(table["id"])] = msg.id
+
+    await save_daily_post(date_str, channel.id, thread.id, table_message_ids)
+    log.info("Daily reservation post created for %s (thread %s)", date_str, thread.id)
+
+
+async def send_confirmation_dms(bot: discord.Client) -> int:
+    """DM every user who has an unconfirmed reservation today. Returns DM count."""
+    date_str = datetime.date.today().isoformat()
+    today    = datetime.date.today()
+    pending  = await get_unconfirmed_reservations_for_date(date_str)
+
+    sent = 0
+    for res in pending:
+        user_id  = res["user_id"]
+        table    = TABLE_MAP[res["table_id"]]
+        slot     = SLOT_MAP[res["slot_id"]]
+
+        try:
+            user = await bot.fetch_user(user_id)
+        except discord.NotFound:
+            log.warning("User %s not found — skipping DM", user_id)
+            continue
+
+        try:
+            await user.send(
+                embed=make_dm_embed(table, slot, today),
+                view=make_dm_view(date_str, table["id"], slot["id"]),
+            )
+            sent += 1
+            log.info("Confirmation DM sent to %s for %s %s", user, table["name"], slot["name"])
+        except discord.Forbidden:
+            log.warning("Cannot DM %s (DMs disabled)", user)
+        except Exception as e:
+            log.error("Error DMing %s: %s", user, e)
+
+    return sent
+
+
+class SchedulerCog(commands.Cog):
+    def __init__(self, bot: commands.Bot):
+        self.bot = bot
+        tz = pytz.timezone(TIMEZONE)
+        self.scheduler = AsyncIOScheduler(timezone=tz)
+
+        self.scheduler.add_job(
+            self._daily_post_job,
+            CronTrigger(hour=DAILY_POST_HOUR, minute=DAILY_POST_MINUTE, timezone=tz),
+            id="daily_post",
+            replace_existing=True,
+        )
+        self.scheduler.add_job(
+            self._confirmation_dm_job,
+            CronTrigger(hour=CONFIRMATION_HOUR, minute=CONFIRMATION_MINUTE, timezone=tz),
+            id="confirmation_dms",
+            replace_existing=True,
+        )
+
+    async def _daily_post_job(self):
+        log.info("Running scheduled daily post job")
+        try:
+            await post_daily_reservations(self.bot)
+        except Exception as e:
+            log.error("Daily post job failed: %s", e)
+
+    async def _confirmation_dm_job(self):
+        log.info("Running scheduled confirmation DM job")
+        try:
+            count = await send_confirmation_dms(self.bot)
+            log.info("Sent %d confirmation DM(s)", count)
+        except Exception as e:
+            log.error("Confirmation DM job failed: %s", e)
+
+    @commands.Cog.listener()
+    async def on_ready(self):
+        if not self.scheduler.running:
+            self.scheduler.start()
+            log.info(
+                "Scheduler started — daily post at %02d:%02d, DMs at %02d:%02d (%s)",
+                DAILY_POST_HOUR, DAILY_POST_MINUTE,
+                CONFIRMATION_HOUR, CONFIRMATION_MINUTE,
+                TIMEZONE,
+            )
+
+    def cog_unload(self):
+        self.scheduler.shutdown(wait=False)
+
+
+async def setup(bot: commands.Bot):
+    await bot.add_cog(SchedulerCog(bot))
