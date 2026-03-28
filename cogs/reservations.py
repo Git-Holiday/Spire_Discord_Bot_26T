@@ -1,5 +1,5 @@
 """
-Reservation cog — handles all button interactions and slash commands.
+Reservation cog — handles all select/button interactions and slash commands.
 """
 import datetime
 import logging
@@ -7,7 +7,7 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
-from config import TABLE_MAP, SLOT_MAP, TABLES, SLOTS, GUILD_ID
+from config import TABLE_MAP, SLOT_MAP, TABLES, SLOTS
 from database import (
     create_reservation,
     delete_reservation,
@@ -18,7 +18,7 @@ from database import (
     update_confirmation,
     get_daily_post,
 )
-from embeds import make_table_embed, make_table_view, make_dm_embed, make_dm_view
+from embeds import make_single_post_embed, make_booking_select, make_dm_embed, make_dm_view
 
 log = logging.getLogger(__name__)
 
@@ -27,37 +27,32 @@ def _today() -> str:
     return datetime.date.today().isoformat()
 
 
-async def refresh_table_message(bot: discord.Client, date_str: str, table_id: int):
-    """Re-renders a table's thread message with current booking state."""
+async def refresh_post_message(bot: discord.Client, date_str: str) -> None:
+    """Re-renders the single daily post with current booking state."""
     daily = await get_daily_post(date_str)
     if not daily:
         return
 
-    msg_id = daily["table_message_ids"].get(str(table_id))
-    if not msg_id:
-        return
-
-    thread = bot.get_channel(daily["thread_id"])
-    if thread is None:
+    channel = bot.get_channel(daily["channel_id"])
+    if channel is None:
         try:
-            thread = await bot.fetch_channel(daily["thread_id"])
+            channel = await bot.fetch_channel(daily["channel_id"])
         except Exception:
-            log.warning("Could not fetch thread %s", daily["thread_id"])
+            log.warning("Could not fetch channel %s", daily["channel_id"])
             return
 
     try:
-        message = await thread.fetch_message(msg_id)
+        message = await channel.fetch_message(daily["post_message_id"])
     except Exception:
-        log.warning("Could not fetch table message %s", msg_id)
+        log.warning("Could not fetch post message %s", daily["post_message_id"])
         return
 
     all_res = await get_day_reservations(date_str)
-    table_res = {r["slot_id"]: r for r in all_res if r["table_id"] == table_id}
+    date    = datetime.date.fromisoformat(date_str)
 
-    table = TABLE_MAP[table_id]
     await message.edit(
-        embed=make_table_embed(table, table_res),
-        view=make_table_view(date_str, table_id, table_res),
+        embed=make_single_post_embed(date, all_res),
+        view=make_booking_select(date_str, all_res),
     )
 
 
@@ -74,80 +69,98 @@ class ReservationsCog(commands.Cog):
 
         cid = interaction.data.get("custom_id", "")
 
-        if cid.startswith("res:"):
-            await self._handle_slot_button(interaction, cid)
+        if cid.startswith("book_select:"):
+            date_str = cid.split(":", 1)[1]
+            values   = interaction.data.get("values", [])
+            value    = values[0] if values else ""
+            if value.startswith("book:"):
+                _, tid, sid = value.split(":")
+                await self._handle_book(interaction, date_str, int(tid), int(sid))
+            elif value == "manage":
+                await self._handle_manage(interaction, date_str)
+            else:
+                await interaction.response.send_message(
+                    "No slots available right now — check back later!", ephemeral=True
+                )
+
         elif cid.startswith("cancel_yes:"):
             await self._handle_self_cancel(interaction, cid)
         elif cid.startswith("cancel_no:"):
             await interaction.response.edit_message(
-                content="👍 Your reservation is still active.", view=None
+                content="👍 Reservation kept!", view=None
             )
         elif cid.startswith("dm_confirm:"):
             await self._handle_dm_response(interaction, cid, confirmed=True)
         elif cid.startswith("dm_cancel:"):
             await self._handle_dm_response(interaction, cid, confirmed=False)
 
-    # ── Slot button (book / cancel / show info) ───────────────────────────────
+    # ── Book from select ──────────────────────────────────────────────────────
 
-    async def _handle_slot_button(self, interaction: discord.Interaction, cid: str):
-        _, date_str, table_id_s, slot_id_s = cid.split(":")
-        table_id = int(table_id_s)
-        slot_id  = int(slot_id_s)
-        user     = interaction.user
-        table    = TABLE_MAP[table_id]
-        slot     = SLOT_MAP[slot_id]
+    async def _handle_book(
+        self, interaction: discord.Interaction, date_str: str, table_id: int, slot_id: int
+    ):
+        table = TABLE_MAP[table_id]
+        slot  = SLOT_MAP[slot_id]
+        user  = interaction.user
 
-        existing = await get_reservation(date_str, table_id, slot_id)
-
-        # Treat a cancelled reservation as available
-        is_available = existing is None or existing.get("confirmed") == 0
-
-        if is_available:
-            ok = await create_reservation(
-                date_str, table_id, slot_id, user.id, user.display_name
+        ok = await create_reservation(date_str, table_id, slot_id, user.id, user.display_name)
+        if ok:
+            await interaction.response.send_message(
+                f"✅ **{table['name']}** — **{slot['name']}** ({slot['time']}) booked for {date_str}!\n"
+                f"You'll get a DM reminder on the morning of your session.",
+                ephemeral=True,
             )
-            if ok:
+            await refresh_post_message(self.bot, date_str)
+        else:
+            # Race condition — slot just taken
+            existing = await get_reservation(date_str, table_id, slot_id)
+            if existing and existing["user_id"] == user.id:
                 await interaction.response.send_message(
-                    f"✅ **{table['name']}** — **{slot['name']}** ({slot['time']}) booked!\n"
-                    f"You'll get a DM reminder on the morning of your session.",
-                    ephemeral=True,
+                    f"You already have **{table['name']}** {slot['name']} booked.", ephemeral=True
                 )
-                await refresh_table_message(self.bot, date_str, table_id)
             else:
                 await interaction.response.send_message(
-                    f"❌ Just missed it — **{table['name']}** {slot['name']} was "
-                    f"taken by someone else. Try another slot!",
+                    f"❌ Just missed it — **{table['name']}** {slot['name']} was just taken. "
+                    f"The list has been refreshed — try another slot!",
                     ephemeral=True,
                 )
+                await refresh_post_message(self.bot, date_str)
 
-        elif existing["user_id"] == user.id:
-            # User owns this booking — offer to cancel
-            view = discord.ui.View(timeout=60)
+    # ── Manage / cancel (ephemeral) ───────────────────────────────────────────
+
+    async def _handle_manage(self, interaction: discord.Interaction, date_str: str):
+        rows = await get_user_reservations_for_date(date_str, interaction.user.id)
+        active = [r for r in rows if r.get("confirmed") != 0]
+
+        if not active:
+            await interaction.response.send_message(
+                "You have no active reservations for today.", ephemeral=True
+            )
+            return
+
+        view = discord.ui.View(timeout=120)
+        for r in active:
+            t = TABLE_MAP[r["table_id"]]
+            s = SLOT_MAP[r["slot_id"]]
             view.add_item(discord.ui.Button(
                 style=discord.ButtonStyle.danger,
-                label="❌ Yes, cancel my reservation",
-                custom_id=f"cancel_yes:{date_str}:{table_id}:{slot_id}",
+                label=f"❌ Cancel {t['name']} — {s['name']}",
+                custom_id=f"cancel_yes:{date_str}:{t['id']}:{s['id']}",
             ))
-            view.add_item(discord.ui.Button(
-                style=discord.ButtonStyle.secondary,
-                label="Keep my reservation",
-                custom_id=f"cancel_no:{date_str}:{table_id}:{slot_id}",
-            ))
-            await interaction.response.send_message(
-                f"You have **{table['name']}** booked for **{slot['name']}** "
-                f"({slot['time']}) on {date_str}.\nWould you like to cancel it?",
-                view=view,
-                ephemeral=True,
-            )
 
-        else:
-            await interaction.response.send_message(
-                f"❌ **{table['name']}** {slot['name']} is booked by "
-                f"**{existing['username']}**.",
-                ephemeral=True,
-            )
+        lines = [
+            f"{TABLE_MAP[r['table_id']]['emoji']} **{TABLE_MAP[r['table_id']]['name']}** — "
+            f"{SLOT_MAP[r['slot_id']]['emoji']} {SLOT_MAP[r['slot_id']]['name']} "
+            f"({SLOT_MAP[r['slot_id']]['time']})"
+            for r in active
+        ]
+        await interaction.response.send_message(
+            "**Your reservations for today:**\n" + "\n".join(lines) + "\n\nClick to cancel one:",
+            view=view,
+            ephemeral=True,
+        )
 
-    # ── Self-cancel confirmation ───────────────────────────────────────────────
+    # ── Self-cancel button ────────────────────────────────────────────────────
 
     async def _handle_self_cancel(self, interaction: discord.Interaction, cid: str):
         _, date_str, table_id_s, slot_id_s = cid.split(":")
@@ -159,10 +172,10 @@ class ReservationsCog(commands.Cog):
         removed = await delete_reservation(date_str, table_id, slot_id, interaction.user.id)
         if removed:
             await interaction.response.edit_message(
-                content=f"✅ Your **{table['name']}** {slot['name']} reservation has been cancelled.",
+                content=f"✅ **{table['name']}** {slot['name']} reservation cancelled.",
                 view=None,
             )
-            await refresh_table_message(self.bot, date_str, table_id)
+            await refresh_post_message(self.bot, date_str)
         else:
             await interaction.response.edit_message(
                 content="⚠️ Could not find your reservation — it may already be cancelled.",
@@ -174,12 +187,12 @@ class ReservationsCog(commands.Cog):
     async def _handle_dm_response(
         self, interaction: discord.Interaction, cid: str, confirmed: bool
     ):
-        parts     = cid.split(":")
-        date_str  = parts[1]
-        table_id  = int(parts[2])
-        slot_id   = int(parts[3])
-        table     = TABLE_MAP[table_id]
-        slot      = SLOT_MAP[slot_id]
+        parts    = cid.split(":")
+        date_str = parts[1]
+        table_id = int(parts[2])
+        slot_id  = int(parts[3])
+        table    = TABLE_MAP[table_id]
+        slot     = SLOT_MAP[slot_id]
 
         existing = await get_reservation(date_str, table_id, slot_id)
         if not existing or existing["user_id"] != interaction.user.id:
@@ -206,7 +219,7 @@ class ReservationsCog(commands.Cog):
                 ),
                 view=None,
             )
-            await refresh_table_message(self.bot, date_str, table_id)
+            await refresh_post_message(self.bot, date_str)
 
     # ── Slash commands ────────────────────────────────────────────────────────
 
@@ -226,8 +239,13 @@ class ReservationsCog(commands.Cog):
             t = TABLE_MAP[r["table_id"]]
             s = SLOT_MAP[r["slot_id"]]
             confirmed = r.get("confirmed")
-            status = "⏳ Unconfirmed" if confirmed is None else ("✔️ Confirmed" if confirmed else "❌ Cancelled")
-            lines.append(f"{t['emoji']} **{t['name']}** · {s['emoji']} {s['name']} ({s['time']}) — {status}")
+            status = (
+                "⏳ Unconfirmed" if confirmed is None
+                else ("✔️ Confirmed" if confirmed else "❌ Cancelled")
+            )
+            lines.append(
+                f"{t['emoji']} **{t['name']}** · {s['emoji']} {s['name']} ({s['time']}) — {status}"
+            )
 
         embed = discord.Embed(
             title=f"📋 Your Reservations — {date_str}",
@@ -237,20 +255,12 @@ class ReservationsCog(commands.Cog):
         await interaction.response.send_message(embed=embed, ephemeral=True)
 
     @app_commands.command(name="reserve", description="Book a table via slash command")
-    @app_commands.describe(
-        table="Which table to book",
-        slot="Which time slot",
-    )
+    @app_commands.describe(table="Which table", slot="Which time slot")
     @app_commands.choices(
         table=[app_commands.Choice(name=f"{t['emoji']} {t['name']} ({t['size']} {t['type']})", value=t["id"]) for t in TABLES],
         slot=[app_commands.Choice(name=f"{s['emoji']} {s['name']} ({s['time']})", value=s["id"]) for s in SLOTS],
     )
-    async def reserve(
-        self,
-        interaction: discord.Interaction,
-        table: int,
-        slot: int,
-    ):
+    async def reserve(self, interaction: discord.Interaction, table: int, slot: int):
         date_str = _today()
         t = TABLE_MAP[table]
         s = SLOT_MAP[slot]
@@ -261,7 +271,7 @@ class ReservationsCog(commands.Cog):
                 f"✅ **{t['name']}** booked for **{s['name']}** ({s['time']}) today!",
                 ephemeral=True,
             )
-            await refresh_table_message(self.bot, date_str, table)
+            await refresh_post_message(self.bot, date_str)
         else:
             existing = await get_reservation(date_str, table, slot)
             if existing and existing["user_id"] == interaction.user.id:
@@ -274,29 +284,19 @@ class ReservationsCog(commands.Cog):
                 )
 
     @app_commands.command(name="admin-cancel", description="[Admin] Cancel any reservation")
-    @app_commands.describe(
-        table="Table to clear",
-        slot="Slot to clear",
-        date="Date (YYYY-MM-DD, defaults to today)",
-    )
+    @app_commands.describe(table="Table", slot="Slot", date="Date YYYY-MM-DD (default: today)")
     @app_commands.choices(
         table=[app_commands.Choice(name=f"{t['emoji']} {t['name']}", value=t["id"]) for t in TABLES],
         slot=[app_commands.Choice(name=f"{s['emoji']} {s['name']}", value=s["id"]) for s in SLOTS],
     )
     @app_commands.default_permissions(manage_guild=True)
     async def admin_cancel(
-        self,
-        interaction: discord.Interaction,
-        table: int,
-        slot: int,
-        date: str = "",
+        self, interaction: discord.Interaction, table: int, slot: int, date: str = ""
     ):
         date_str = date or _today()
         existing = await get_reservation(date_str, table, slot)
         if not existing:
-            await interaction.response.send_message(
-                "No reservation found for that table/slot.", ephemeral=True
-            )
+            await interaction.response.send_message("No reservation found.", ephemeral=True)
             return
 
         t = TABLE_MAP[table]
@@ -304,11 +304,10 @@ class ReservationsCog(commands.Cog):
         removed = await admin_delete_reservation(date_str, table, slot)
         if removed:
             await interaction.response.send_message(
-                f"✅ Cleared **{t['name']}** {s['name']} reservation "
-                f"(was held by **{existing['username']}**).",
+                f"✅ Cleared **{t['name']}** {s['name']} (was **{existing['username']}**).",
                 ephemeral=True,
             )
-            await refresh_table_message(self.bot, date_str, table)
+            await refresh_post_message(self.bot, date_str)
         else:
             await interaction.response.send_message("Failed to remove reservation.", ephemeral=True)
 

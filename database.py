@@ -1,5 +1,4 @@
 import aiosqlite
-import json
 from typing import Optional
 
 DB_PATH = "reservations.db"
@@ -21,10 +20,9 @@ async def init_db():
         """)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS daily_posts (
-                date             TEXT PRIMARY KEY,
-                channel_id       INTEGER NOT NULL,
-                thread_id        INTEGER NOT NULL,
-                table_message_ids TEXT NOT NULL
+                date            TEXT    PRIMARY KEY,
+                channel_id      INTEGER NOT NULL,
+                post_message_id INTEGER NOT NULL
             )
         """)
         await db.commit()
@@ -122,14 +120,11 @@ async def update_confirmation(
 
 # ── Daily posts ──────────────────────────────────────────────────────────────
 
-async def save_daily_post(
-    date: str, channel_id: int, thread_id: int, table_message_ids: dict
-) -> None:
+async def save_daily_post(date: str, channel_id: int, post_message_id: int) -> None:
     async with aiosqlite.connect(DB_PATH) as db:
         await db.execute(
-            "INSERT OR REPLACE INTO daily_posts "
-            "(date, channel_id, thread_id, table_message_ids) VALUES (?,?,?,?)",
-            (date, channel_id, thread_id, json.dumps(table_message_ids)),
+            "INSERT OR REPLACE INTO daily_posts (date, channel_id, post_message_id) VALUES (?,?,?)",
+            (date, channel_id, post_message_id),
         )
         await db.commit()
 
@@ -141,8 +136,4 @@ async def get_daily_post(date: str) -> Optional[dict]:
             "SELECT * FROM daily_posts WHERE date=?", (date,)
         ) as cur:
             row = await cur.fetchone()
-            if not row:
-                return None
-            d = dict(row)
-            d["table_message_ids"] = json.loads(d["table_message_ids"])
-            return d
+            return dict(row) if row else None

@@ -7,102 +7,107 @@ from config import TABLES, SLOTS, TABLE_MAP, SLOT_MAP
 from typing import Optional
 
 
-# ── Header embed (posted once per day in the channel) ────────────────────────
+# ── Single daily post embed ───────────────────────────────────────────────────
 
-def make_header_embed(date: datetime.date) -> discord.Embed:
+def _slot_status(res: Optional[dict]) -> str:
+    if res is None or res.get("confirmed") == 0:
+        return "✅ Available"
+    confirmed = res.get("confirmed")
+    name = res["username"]
+    return f"⏳ {name}" if confirmed is None else f"✔️ {name}"
+
+
+def make_single_post_embed(date: datetime.date, all_reservations: list) -> discord.Embed:
     day_str = date.strftime("%A, %d %B %Y")
+
+    # Build lookup: {table_id: {slot_id: reservation}}
+    res_map: dict[int, dict] = {}
+    for r in all_reservations:
+        if r.get("confirmed") != 0:          # exclude cancelled
+            res_map.setdefault(r["table_id"], {})[r["slot_id"]] = r
+
+    type_labels = {
+        "Standard": "8×4 Standard",
+        "Raised":   "6×4 Raised",
+        "Low":      "6×4 Low",
+        "Hobby":    "Small workspace",
+    }
+
     embed = discord.Embed(
         title=f"📅 Table Reservations — {day_str}",
         description=(
-            "Reserve a gaming table for today by clicking into the thread below "
-            "and pressing an available slot button.\n\n"
-            "**⏱ Time Slots**\n"
-            "🌅 **Morning** · 10:00–13:00\n"
-            "☀️ **Afternoon** · 13:00–17:00\n"
-            "🌆 **Evening** · 17:00–21:00\n\n"
-            "**🗺 Tables**\n"
-            "🟫 Tables 1–3 · 8×4 Standard\n"
-            "🟦 Tables 4–5 · 6×4 Raised\n"
-            "🟩 Table 6 · 6×4 Low\n"
-            "🎨 Hobby Table · Small workspace at the back\n\n"
-            "*You'll receive a DM confirmation on the morning of your reservation.*"
+            "Use the dropdown below to book a slot. "
+            "You'll get a DM confirmation on the morning of your session."
         ),
         colour=discord.Colour.blurple(),
     )
-    embed.set_footer(text="Click a green slot to book · Click your own booking to cancel")
-    return embed
 
+    for table in TABLES:
+        table_res = res_map.get(table["id"], {})
+        lines = []
+        for slot in SLOTS:
+            status = _slot_status(table_res.get(slot["id"]))
+            lines.append(f"{slot['emoji']} **{slot['name']}** ({slot['time']}):  {status}")
 
-# ── Per-table embed ───────────────────────────────────────────────────────────
-
-def _slot_field_value(reservation: Optional[dict]) -> str:
-    if reservation is None:
-        return "✅ Available"
-    confirmed = reservation.get("confirmed")
-    name = reservation["username"]
-    if confirmed is None:
-        return f"⏳ {name}"
-    if confirmed:
-        return f"✔️ {name}"
-    return "✅ Available"  # was cancelled
-
-
-def make_table_embed(table: dict, reservations: dict) -> discord.Embed:
-    """
-    reservations: {slot_id (int): reservation dict | None}
-    """
-    type_labels = {
-        "Standard": "Standard Gaming Table",
-        "Raised":   "Raised Gaming Table",
-        "Low":      "Low Gaming Table",
-        "Hobby":    "Hobby / Painting Workspace",
-    }
-    label = type_labels.get(table["type"], table["type"])
-    embed = discord.Embed(
-        title=f"{table['emoji']} {table['name']} · {table['size']} {label}",
-        colour=table["colour"],
-    )
-    for slot in SLOTS:
-        res = reservations.get(slot["id"])
         embed.add_field(
-            name=f"{slot['emoji']} {slot['name']} ({slot['time']})",
-            value=_slot_field_value(res),
-            inline=True,
+            name=f"{table['emoji']} {table['name']}  ·  {type_labels.get(table['type'], table['type'])}",
+            value="\n".join(lines),
+            inline=False,
         )
+
+    embed.set_footer(text="Green = available  ·  ⏳ = unconfirmed  ·  ✔️ = confirmed")
     return embed
 
 
-# ── Per-table button view ─────────────────────────────────────────────────────
+# ── Booking select (dropdown) ─────────────────────────────────────────────────
 
-def make_table_view(date_str: str, table_id: int, reservations: dict) -> discord.ui.View:
+def make_booking_select(date_str: str, all_reservations: list) -> discord.ui.View:
     """
-    reservations: {slot_id (int): reservation dict | None}
-    Buttons with custom_id "res:{date}:{table_id}:{slot_id}" are caught by
-    the on_interaction listener in cogs/reservations.py.
+    Dropdown showing all available slots to book, plus a 'manage' option.
+    custom_id = "book_select:{date}" — caught by on_interaction in reservations.py.
     """
+    taken: dict[tuple, dict] = {}
+    for r in all_reservations:
+        if r.get("confirmed") != 0:
+            taken[(r["table_id"], r["slot_id"])] = r
+
+    type_short = {"Standard": "8×4 Std", "Raised": "6×4 Raised", "Low": "6×4 Low", "Hobby": "Small"}
+
+    options: list[discord.SelectOption] = []
+    for table in TABLES:
+        for slot in SLOTS:
+            if (table["id"], slot["id"]) not in taken:
+                options.append(discord.SelectOption(
+                    label=f"{table['name']} — {slot['name']} ({slot['time']})",
+                    value=f"book:{table['id']}:{slot['id']}",
+                    emoji=table["emoji"],
+                    description=type_short.get(table["type"], table["type"]),
+                ))
+
+    if not options:
+        options.append(discord.SelectOption(
+            label="No tables available — check back later",
+            value="none",
+            emoji="😴",
+        ))
+
+    options.append(discord.SelectOption(
+        label="Cancel one of my reservations",
+        value="manage",
+        emoji="🗑️",
+        description="View and cancel your existing bookings",
+    ))
+
+    # Discord hard cap: 25 options
+    if len(options) > 25:
+        options = options[:24] + [options[-1]]   # keep manage at end
+
     view = discord.ui.View(timeout=None)
-    for slot in SLOTS:
-        res = reservations.get(slot["id"])
-        custom_id = f"res:{date_str}:{table_id}:{slot['id']}"
-
-        # Cancelled reservations are treated as available
-        is_available = res is None or res.get("confirmed") == 0
-
-        if is_available:
-            btn = discord.ui.Button(
-                style=discord.ButtonStyle.success,
-                label=f"{slot['emoji']} {slot['name']}",
-                custom_id=custom_id,
-            )
-        else:
-            # Show who booked it; the callback decides if the clicker can cancel
-            uname = res["username"][:20]
-            btn = discord.ui.Button(
-                style=discord.ButtonStyle.secondary,
-                label=f"👤 {uname}",
-                custom_id=custom_id,
-            )
-        view.add_item(btn)
+    view.add_item(discord.ui.Select(
+        placeholder="📋  Choose a table and time slot to book...",
+        options=options,
+        custom_id=f"book_select:{date_str}",
+    ))
     return view
 
 
@@ -110,12 +115,7 @@ def make_table_view(date_str: str, table_id: int, reservations: dict) -> discord
 
 def make_dm_embed(table: dict, slot: dict, date: datetime.date) -> discord.Embed:
     day_str = date.strftime("%A, %d %B %Y")
-    type_labels = {
-        "Standard": "Standard",
-        "Raised":   "Raised",
-        "Low":      "Low",
-        "Hobby":    "Hobby",
-    }
+    type_labels = {"Standard": "Standard", "Raised": "Raised", "Low": "Low", "Hobby": "Hobby"}
     embed = discord.Embed(
         title="🎲 Table Reservation — Confirm for Today",
         description=(
